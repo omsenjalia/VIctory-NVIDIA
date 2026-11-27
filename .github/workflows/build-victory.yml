@@ -1,0 +1,134 @@
+# Builds victory.exe for Windows (MSVC) with maximum performance codegen
+# (fat LTO, one codegen unit, znver3), verifies it, and uploads it as an
+# artifact. When a tag is pushed, the same files are attached to a GitHub
+# Release.
+#
+# Why znver3 and not native: the CI runner's CPU is not the machine the
+# program will run on. target-cpu=native in CI would bake the runner's
+# instruction set into the exe and could crash with "illegal instruction" on
+# your PC. znver3 matches a Ryzen 5 7235HS (Zen 3+), and covers everything
+# x86-64-v3 has plus Zen-specific scheduling.
+#
+# The diagnostics feature is intentionally NOT enabled. The plain release
+# build has it off; this workflow does not pass --features diagnostics.
+
+name: Build victory.exe (Windows, max perf)
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-victory-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Do NOT change to -C target-cpu=native (see header). Do NOT add
+  # -C target-feature=+avx512...: Zen 3 has no AVX-512.
+  RUSTFLAGS: -C target-cpu=znver3
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 240
+    # contents: write is used ONLY by the "attach to a Release" step below
+    # (creating or updating a Release for a tag). Nothing else in this job
+    # writes to the repository.
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Install the Rust toolchain pinned by rust-toolchain.toml
+        # The repo pins the exact channel (1.98.1), the
+        # x86_64-pc-windows-msvc target and the rustfmt/clippy components;
+        # this reads that file. A bare `stable` would be overridden by
+        # rust-toolchain.toml inside the repo anyway and could silently drift
+        # from the toolchain this repository is tested with.
+        run: rustup toolchain install
+
+      - name: Show toolchain versions
+        shell: pwsh
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Cache the Cargo registry, git dependencies and the target directory
+        # Swatinem/rust-cache caches ~/.cargo/registry, ~/.cargo/git and the
+        # workspace target/ directory by default. cache-on-failure lets a
+        # half-done build still warm the cache for the next run.
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          cache-on-failure: true
+
+      - name: Build victory.exe (release, --locked, no diagnostics)
+        shell: pwsh
+        run: |
+          Write-Host "RUSTFLAGS = $env:RUSTFLAGS"
+          cargo build --release -p victory --locked
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error title=Build failed::cargo build exited with code $LASTEXITCODE. Read the compiler output above for the first error. Notes: the diagnostics feature is OFF in this workflow on purpose; if the build died with an out-of-memory error, change lto to 'thin' in Cargo.toml ([profile.release]) and push again."
+            exit $LASTEXITCODE
+          }
+
+      - name: Verify victory.exe exists and print its size
+        shell: pwsh
+        run: |
+          $exe = Join-Path $env:GITHUB_WORKSPACE 'target\release\victory.exe'
+          if (-not (Test-Path -LiteralPath $exe)) {
+            Write-Host "::error title=victory.exe missing::$exe was not produced. The build step must have failed or written elsewhere; search the log above for 'error'."
+            exit 1
+          }
+          $size = (Get-Item -LiteralPath $exe).Length
+          Write-Host ("victory.exe: {0:N1} MB ({1:N0} bytes)" -f ($size / 1MB), $size)
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "**victory.exe**: $([math]::Round($size / 1MB, 1)) MB"
+
+      - name: Stage artifacts and a SHA256 checksum file
+        shell: pwsh
+        run: |
+          $dist = Join-Path $env:GITHUB_WORKSPACE 'dist'
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+          Copy-Item (Join-Path $env:GITHUB_WORKSPACE 'target\release\victory.exe') $dist
+          Copy-Item (Join-Path $env:GITHUB_WORKSPACE 'scripts\play-lowend.ps1') $dist
+          Get-ChildItem -LiteralPath $dist -File |
+            Where-Object { $_.Name -ne 'checksums.txt' } |
+            ForEach-Object {
+              $hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLower()
+              "{0}  {1}" -f $hash, $_.Name
+            } | Set-Content -Path (Join-Path $dist 'checksums.txt') -Encoding ascii
+          Write-Host '--- checksums.txt ---'
+          Get-Content -LiteralPath (Join-Path $dist 'checksums.txt')
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: victory-windows
+          path: |
+            dist/victory.exe
+            dist/play-lowend.ps1
+            dist/checksums.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Attach artifacts to a GitHub Release (only when a tag is pushed)
+        # Runs only on tag pushes (refs/tags/*), not on branch pushes or PRs.
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          files: |
+            dist/victory.exe
+            dist/play-lowend.ps1
+            dist/checksums.txt
+          fail_on_unmatched_files: true
+
+      - name: If the build failed, where to look
+        if: failure()
+        shell: pwsh
+        run: |
+          Write-Host "::notice title=Build failed::Expand the first red step above; the first red error line is the cause. Common cases: (1) '--locked' mismatch means Cargo.toml and Cargo.lock drifted, regenerate the lockfile locally and commit it; (2) a toolchain error means rust-toolchain.toml could not be installed, check that the pinned channel exists; (3) an out-of-memory error during codegen means switch lto to 'thin' in Cargo.toml."
