@@ -70,7 +70,21 @@ undocumented_unsafe_blocks = "allow"
 opt-level = 2
 
 [profile.release]
+# Maximum runtime speed, per docs/findings.md being CPU-bound: fat LTO over
+# the whole workspace in a single code generation unit. Builds take longer
+# (this is a large workspace); if CI runs out of memory or time, change
+# lto to "thin" and raise codegen-units.
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+# Line tables: a little size, in exchange for readable crash stacks
+# (the loader's crash reporter names faults as module+rva).
 debug = "line-tables-only"
+# panic = "abort" is deliberately NOT set. This code catches unwinds in
+# worker code (descriptor sync, the translation workers, the threads that
+# land shader writes, the cold-path copy of aside.rs) to contain faults;
+# aborting would turn a recoverable worker fault into an instant crash of
+# the whole game.
 
 # The development build: release code generation plus the `diagnostics`
 # feature (`cargo build --profile diag -p victory --features diagnostics`),
